@@ -1,0 +1,1376 @@
+---
+title: "Credit Card Approval Prediction"
+author: Final Group 7 - Members SID:500389793,500421956, 500138423, 500193673, 440428183,
+  500207796, 500297661
+date: "10/12/2020"
+output:
+  pdf_document: default
+  fig_caption: yes
+  html_document:
+    code_folding: hide
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(VIM)
+library(mice)
+library(ggpubr)
+library(glmnet)
+library(DMwR)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(ranger)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(xgboost)
+library(randomForest)
+library(rattle)
+library(gbm)
+library(ipred)
+library(ROCR)
+library(pROC)
+library(gridExtra)
+library(kernlab)
+library(reshape2)
+library(mlbench)
+library(MLmetrics)
+library(MASS)
+```
+***
+
+
+```{r eval=FALSE,include=FALSE,cache =TRUE}
+## Reading Data
+#changing to factor later is very slow
+headset <- read.csv("application_record.csv", header = TRUE, nrows = 100)
+classes <- sapply(headset, class)
+classes[grepl("FLAG_", names(classes))] <- "factor"
+
+#read application data
+appl.data <- read.csv("application_record.csv", header = TRUE, stringsAsFactors=T, colClasses = classes, na.strings=c("","NA"))
+
+#Checking ID duplication
+ID_rep <- appl.data %>% group_by(ID) %>% summarise(COUNT= length(ID)) %>% filter(COUNT > 1)
+
+#drop repeated records
+appl.data <- appl.data %>% filter(!(ID %in% ID_rep$ID))
+
+
+#read credit records
+cr.records <- read.csv("credit_record.csv", header = TRUE, stringsAsFactors=T, na.strings=c("","NA"))
+
+
+#classes mapping 
+                           # c(0,   1    2,   3,   4,   5    C,   X)
+levels(cr.records$STATUS) <- c("0", "0", "1", "1", "1", "1", "0", "0")
+
+#for each customer id, grab his  max Status
+cr.status <- as.data.frame(cr.records %>% group_by(ID) %>% summarise(STATUS= max(as.numeric(STATUS)-1)))
+
+cr.status <- cr.status %>% mutate(STATUS= as.factor(STATUS))
+
+data <- merge(appl.data, cr.status,by='ID')
+
+#change Days birth to years
+data <- data %>% mutate(DAYS_BIRTH= round(-DAYS_BIRTH/365)) %>% rename(AGE= DAYS_BIRTH)
+
+#change days employed to years
+data <- data %>% mutate(DAYS_EMPLOYED= round(-DAYS_EMPLOYED/365)) %>% rename(YEARS_EMPLOYED= DAYS_EMPLOYED)
+
+```
+### 1. Introduction
+<p style="font-family: times, serif; font-size:10pt">
+Evaluating a customer's merit before issuing a credit card is a critical task for any financial institution. An applicant's credit history and personal details are used to predict their credit eligibility. Machine Learning is pivotal for solving this problem, where data complexity and volume requires using complex methods to detect patterns and inferences from the data. Our objective is to predict the risk for a customer (risky/not risky) and not paying off his credit debt in time based on a range of features.
+</p>
+
+### 2. Dataset Description
+<p style="font-family: times, serif; font-size:10pt" >
+The dataset [https://www.kaggle.com/rikdifos/credit-card-approval-prediction](https://www.kaggle.com/rikdifos/credit-card-approval-prediction) is comprised of two tables: the application data and the credit history. The first table contains 18 columns of both **numerical and categorical data** of applicant's personal details. The second table records the status of credit card payment for each applicant for each month. The two files are linked by ID. The joint IDs across the two tables are **36440** samples. Both DAYS_BIRTH and DAYS_EMPLOYED count backwards from current day (0), -1 means yesterday. If DAYS_EMPLOYED is positive, it means the person is currently unemployed. The MONTHS also counts backwards from The month of the extracted data.
+</p>
+
+```{r out.width="49.5%", out.height = '160px', fig.cap="Table 1: Dataset Description", fig.align = "center", fig.show='hold',echo=FALSE}
+knitr::include_graphics(c("table.png", "table2.png"))
+```
+
+### 3. Methodology
+<div>
+<div style= "float: right; position: relative; top: -40px;">
+``` {r fig.height=1.5, fig.width=2.5, fig.align = "center",eval=FALSE}
+#histogram
+ggplot(data, aes(x= STATUS)) + geom_bar(width = 0.1) + scale_x_discrete(labels=c("Low Risk", "High Risk"))+labs(x="Status",y = "Count"
+                                                                                                                #,title = paste0("Frequency Distribution of", "\n", "Status")
+                                                                                                                )+theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r echo=FALSE, out.width="50%", out.height = '50%', fig.align = "center"}
+knitr::include_graphics(c("class_imbalance.PNG"))
+```
+
+</div>
+<p style="font-family: times, serif; font-size:10pt">
+The Credit history is grouped by ID and aggregated on the maximum STATUS given for a customer during his recorded months. The result is joined with the application data to form a single record per user. It is important to note that 47 IDs in the Application Data were repeated, with records not being true duplicates. These records were therefore deemed corrupt and dropped before merger. FLAG_MOBIL which states whether a customer has a mobile phone or not is all ones, so was dropped from the data. DAYS_BIRTH and DAYS_EMPLOYED are transformed into years by multiplying them to -1/365, and subsequently renamed into AGE and YEARS_EMPLOYED. After some analysis and research on the data, **we decided that the categories for late payment which are 60 days and above (>= 2) are to be labeled as risky, and otherwise non-risky. Using filled bar charts, grouped densities, as well as T-SNE for classes visualization, we chose to pursue a binary classification problem, seeing the high inseparability between between risk (2,3) and high risk (4,5) classes**. The resultant class distribution is shown.
+</p>
+
+</div>
+
+
+### 4. Exploratory Data Analysis
+
+#### 4.1 Class Imbalance
+
+<p style="font-family: times, serif; font-size:10pt">
+Class Imbalance is an evident challenge for this classification problem, risky customers only constitute 1.4% of the data. Class imbalance can negatively impact machine learning models, but can be rectified through SMOTE (Synthetic Minority Oversampling TEchnique).
+</p>
+
+#### 4.2 Outliers
+<div>
+
+<div style="position: relative;float: right">
+```{r eval=FALSE,fig.height=2.5}
+#distribution of cont variables
+g1 <- ggplot(data= data, aes(x= STATUS, y= AMT_INCOME_TOTAL)) + geom_boxplot(aes(color= STATUS))
+g2 <- ggplot(data= data, aes(x= STATUS, y= CNT_FAM_MEMBERS)) + geom_boxplot(aes(color= STATUS))
+grid.arrange(g1,g2,ncol= 2)
+```
+```{r echo=FALSE,out.height = "50%", fig.width=3, fig.align = "center"}
+knitr::include_graphics(c("Outliers.PNG"))
+```
+</div>
+<p style="font-family: times, serif; font-size:10pt" >
+Family members above 5 and income above a million were considered outliers and subsequently discarded from the data set. Also there is little distinction when considering the class variable.</p>
+
+```{r eval=FALSE,fig.height=2,fig.width=10}
+ggplot(data= data, aes(x= AMT_INCOME_TOTAL, y= NAME_INCOME_TYPE, fill= NAME_INCOME_TYPE)) + geom_boxplot()
+```
+
+
+```{r eval=FALSE}
+#manage outliers
+data <- data %>% filter(CNT_FAM_MEMBERS <= 5)
+data <- data %>% filter(AMT_INCOME_TOTAL < 1000000)
+```
+</div>
+
+#### 4.3 Correlation
+<div>
+<div style= "float: right; position: relative; top: -10px;">
+```{r echo=FALSE,out.width="300px", out.height = '200px', fig.align = "center"}
+knitr::include_graphics("corr.png")
+```
+</div>
+<p style="font-family: times, serif; font-size:10pt">
+The correlation matrix provides some insights. Family Status is as expected correlated to the family members. **Count children is highly correlated to family members, which means this feature could be redundant. Count children is also expectedly correlated to age. Years employed also is correlated to the income type**. Years employed is also highly correlated to age. Most findings are intuitive, which gives credence to the data being reliable.
+</p>
+
+```{r eval=FALSE, fig.height = 4, fig.width = 5, warning=FALSE, fig.env = 'wrapfigure', wrapf=TRUE}
+
+df_application = read.csv(file = 'application_record.csv')
+df_application <- df_application[ -c(1) ]
+
+#df_application <- appl.data
+
+cormat <- round(cor(data.matrix(df_application)),1)
+
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+  cormat[lower.tri(cormat)]<- NA
+  return(cormat)
+}
+
+upper_tri <- get_upper_tri(cormat)
+
+melted_cormat <- melt(upper_tri, na.rm = TRUE)
+
+# Heatmap
+ggheatmap <- ggplot(melted_cormat, aes(Var2, Var1, fill = value))+
+geom_tile(color = "white")+
+scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, 
+                     limit = c(-1,1), space = "Lab", name="Pearson\nCorrelation") +
+theme_minimal()+ # minimal theme
+theme(axis.text.x = element_text(angle = 45, vjust = 1, size = 7, hjust = 1))+
+coord_fixed()
+
+ggheatmap + 
+geom_text(aes(Var2, Var1, label = value), color = "black", size = 2.5) +
+theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks = element_blank(),
+  legend.justification = c(1, 0),
+  legend.position = c(0.6, 0.7),
+  legend.direction = "horizontal")+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                title.position = "top", title.hjust = 0.5))
+
+```
+</div>
+
+#### 4.4 Data Missingness
+
+<p style="font-family: times, serif; font-size:10pt">
+OCCUPATION_TYPE had 31% (11,323) missing records. Using a boolean variable to indicate whether occupation type was available or not, a correlation was established with the rest of the features to find a pattern. **It was discovered that the occupation missingness was mostly correlated with Age (mean at 55 shown by the margin plot), specifically many of the missing values were for Pensioners (6139 records)**. 
+</p>
+
+##### Looking at Occupations
+<div>
+<div style= "float: right; position: relative;">
+
+```{r eval=FALSE,fig.height=6, fig.width=10, fig.align = "center"}
+ggplot(data = data, aes(y= OCCUPATION_TYPE, x= AGE, color= OCCUPATION_TYPE)) + geom_boxplot()
+```
+```{r echo=FALSE,fig.align = "center"}
+knitr::include_graphics(c("occupation_type.png"))
+```
+</div>
+</div>
+
+##### Looking at Negative Years Employed
+<div>
+<div style= "float: right; position: relative;">
+```{r eval=FALSE,fig.height=2, fig.width=5, fig.align = "center"}
+ggplot(data= data, aes(y= NAME_INCOME_TYPE, x= YEARS_EMPLOYED, fill= NAME_INCOME_TYPE)) + geom_bar(stat= "identity")
+```
+```{r echo=FALSE,fig.height=2, fig.width=5, fig.align = "center"}
+knitr::include_graphics(c("income_type.PNG"))
+```
+</div>
+<p style="font-family: times, serif; font-size:10pt">
+The Years Employed is made negative for the unemployed. Notice that happens with the Income Type= Pensioner. Pensioners constitute the majority of Occupation Type = NA, which justifies the seemingly high correlation between Years Employed being highly negative, matching an Occupation level of NA. We replaced NA Occupation that have an Income Type = "Pensioner", with the level "Retired".
+</p>
+</div>
+
+
+
+##### Looking at Age and Years Employed
+<div>
+<div style= "float: right; position: relative; top: -30px;">
+
+```{r eval=FALSE,fig.height=4, fig.width=10}
+ggplot(data= subset(data, YEARS_EMPLOYED > 0), aes(x= YEARS_EMPLOYED, y= AGE)) + geom_point()
+```
+```{r echo=FALSE,,fig.height=4, fig.width=10}
+knitr::include_graphics(c("age_years_employed.PNG"))
+```
+</div>
+<p style="font-family: times, serif; font-size:10pt">
+For only the currently employed, strikingly, the Years Employed has a high variance with respect to Age, with many of older generation having years of experience less than a decade.
+</p>
+</div>
+
+#### 4.5 Duplicates
+
+<div>
+```{r eval=FALSE,warning=FALSE,message=FALSE}
+
+#drop ID
+data <- data[, !colnames(data) %in% c("ID", "FLAG_MOBIL", "CNT_CHILDREN")]
+
+#remove duplicates
+duplicates <- which(duplicated(data))
+data_before <- data
+data <- data[-duplicates,]
+```
+<div style= "float: right; position: relative; top: -80px;">
+# Please fix plot here 
+```{r eval=FALSE,fig.height=3, fig.width=6}
+p <- plot(density(data$AGE), col= "red", xlab= "AGE", main= "Difference in Distribution Before and After Filtration")
+lines(density(data_before$AGE))
+legend("center", 
+  legend = c("Filtered Density", "Duplication Density"), 
+  col = c("black", "red" ),
+  pch = c(15,15))
+```
+</div>
+
+<p style="font-family: times, serif; font-size:10pt">
+Upon removing the ID variable, many duplicates were discovered, which we had to discard to maintain data integrity. Here we show the distribution of the Age variable before and after the removal of duplicates. The distribution seems maintained.Nearly 68% of the data were dropped.</p>
+</div>
+
+
+
+```{r eval=FALSE,warning=FALSE,message=FALSE}
+#set Pensioner's occupation to retired
+data$OCCUPATION_TYPE <- as.character(data$OCCUPATION_TYPE)
+data$OCCUPATION_TYPE[is.na(data$OCCUPATION_TYPE) & data$NAME_INCOME_TYPE == "Pensioner" ] <- "Retired"
+data$OCCUPATION_TYPE <- as.factor(data$OCCUPATION_TYPE)
+
+
+# Manage data inaccuracy
+#set values to NA
+data$YEARS_EMPLOYED[data$YEARS_EMPLOYED < 1] <- NA
+```
+
+##### 4.5 Prediction Complexity
+
+This is how much overlap between both classes exist.
+
+```{r eval=FALSE,fig.width= 4, fig.height=4}
+
+#Income distribution by Risk Status
+ggplot(data,aes(x = AMT_INCOME_TOTAL,fill = STATUS))+geom_density(alpha = 0.4)+labs(title = "Income distribution by STATUS")+scale_x_continuous(limits = c(0,1000000))+xlab("Income") + ylab("Density") + theme(legend.position=c(0.8,1), legend.justification=c(0, 1))
+
+```
+
+Class 1 exits among almost all professions. Also among real estate and car owners. Also all social statuses.
+
+```{r eval=FALSE,fig.width= 6, fig.height= 4}
+
+g1 <- ggplot(data= data, aes(x= OCCUPATION_TYPE, fill= STATUS)) + geom_bar(stat= "count") + coord_flip()
+g2 <- ggplot(data= data, aes(x= FLAG_OWN_REALTY, fill= STATUS)) + facet_grid(. ~ FLAG_OWN_CAR) + geom_bar(stat= "count", width= 0.5) +
+  labs(x="FLAG_OWN_REALTY",title = "FLAG_OWN_CAR")
+
+ggarrange(g1, g2, ncol= 2, common.legend = T)
+```
+### 5.Feature Engineering
+
+##### 5.1 Imputation
+<div>
+<p style="font-family: times, serif; font-size:10pt">
+The Years Employed and Occupation Type NA values are imputed. We applied three different types of imputation;Mean impuation or replacing with 43 Years of experience for Pensioners or MICE imputation.
+We went with the MICE imputation which mi#micks the original distribution very well.
+<div>   
+```{r echo=FALSE,out.width="300px", out.height = '200px', fig.align = "center"}
+knitr::include_graphics("Imputation.png")
+```
+</div>
+</div>
+
+```{r eval=FALSE,warning=FALSE,message=FALSE, fig.height=5, fig.width=12,cache=TRUE}
+#testing placing pensioners as 43 years of experience
+#years_employed <- data$YEARS_EMPLOYED
+#years_employed1 <- data$YEARS_EMPLOYED
+#years_employed1[data$NAME_INCOME_TYPE == "Pensioner" ] <- 43
+
+#testing mean imputing all
+#years_employed2 <- data$YEARS_EMPLOYED
+#years_employed2[is.na(years_employed2) ] <- mean(years_employed2, na.rm= TRUE)
+
+set.seed(7)
+## testing MICE imputaion
+imp <- mice(data, method="pmm", m= 1, maxit= 20, seed=7, 
+            pred=quickpred(data, method="spearman"))
+
+#choosing MICE
+data$YEARS_EMPLOYED[is.na(data$YEARS_EMPLOYED)] <- imp$imp$YEARS_EMPLOYED[,1]
+data$OCCUPATION_TYPE[is.na(data$OCCUPATION_TYPE)] <- levels(data$OCCUPATION_TYPE)[imp$imp$OCCUPATION_TYPE[,1]]
+
+df1 <- data.frame("True Density"= years_employed, "Imputing as 43 For Pensioners"= years_employed1)
+df2= data.frame("True Density"= years_employed, "Mean Imputation"= years_employed2)
+df3 <- data.frame("True Density"= years_employed, "MICE PMM Imputation"= data$YEARS_EMPLOYED)
+
+df1 <- reshape2::melt(df1)
+colnames(df1) <- c("Imputation_Method", "YEARS_EMPLOYED")
+df1$Imputation_Method= as.factor(df1$Imputation_Method)
+
+df2 <- reshape2::melt(df2)
+colnames(df2) <- c("Imputation_Method", "YEARS_EMPLOYED")
+df2$Imputation_Method= as.factor(df2$Imputation_Method)
+
+df3 <- reshape2::melt(df3)
+colnames(df3) <- c("Imputation_Method", "YEARS_EMPLOYED")
+df3$Imputation_Method= as.factor(df3$Imputation_Method)
+
+g1 <- ggplot(data= df1, aes(x= YEARS_EMPLOYED, fill= Imputation_Method)) + geom_density(alpha = 0.4) + 
+    theme(legend.position=c(0.2,1), legend.justification=c(0, 1))
+g2 <- ggplot(data= df2, aes(x= YEARS_EMPLOYED, fill= Imputation_Method)) + geom_density(alpha = 0.4) + 
+    theme(legend.position=c(0.2,1), legend.justification=c(0, 1))
+g3 <- ggplot(data= df3, aes(x= YEARS_EMPLOYED, fill= Imputation_Method)) + geom_density(alpha = 0.4) + 
+    theme(legend.position=c(0.2,1), legend.justification=c(0, 1))
+
+ggarrange(g1,g2,g3, ncol=3)
+
+save(data, file= "data_imputed.Rda")
+
+```
+
+
+```{r eval=FALSE,TrainTestSplit}
+#Splitting the dataset
+
+#load data
+load("data_imputed.Rda")
+
+
+data$INCOME_TO_FAM_RATIO <- data$AMT_INCOME_TOTAL/data$CNT_FAM_MEMBERS
+
+set.seed(7)
+inTrain= createDataPartition(data$STATUS, p= 0.8)[[1]]
+Train= data[inTrain, ]
+Test = data[-inTrain, ]
+y_Train <- Train$STATUS
+y_Test <- Test$STATUS
+
+#initialise result
+results <- function(...,truth,model.names){
+  auc <- c()
+  f1 <- c()
+  
+  for(pred in list(...)){
+    cf <- confusionMatrix(factor(pred),truth ,mode = "everything",positive = '1')
+
+    pred <- prediction(as.numeric(pred), as.numeric(truth))
+    perf <- performance(pred, measure = "tpr", x.measure = "fpr")
+    #plot(perf, col=rainbow(10),main ='ROC curve Smote RF Model')
+    auc.tmp <- performance(pred, "auc")
+    auc <- c(auc,as.numeric(auc.tmp@y.values) )
+    f1<-c(f1,cf$byClass[7])
+    
+  }
+      return (data.frame(model.names, auc, f1))
+}
+
+```
+
+
+##### 5.2 SMOTE
+<div>
+<div style= "float: right; position: relative; top: -10px;">
+```{r out.width="300px", out.height = '200px', fig.align = "center",echo=FALSE}
+knitr::include_graphics("SMOTE.png")
+```
+</div>
+
+<p style="font-family: times, serif; font-size:10pt">
+Due to high imbalanced characteristics of data set,applied SMOTE to solve the imbalance issue.The minority class were oversampled using SMOTE. SMOTE was applied only to training data set in order to avoid the potential information Leakage.The distribution of the target class becomes almost 50 - 50 % after using SMOTE. However, after some experimenting, we noticed that not every model works well with SMOTE data. Some models might have their own hyperparameters that can be tuned to decrease the effect and solve the imbalanced data issue using weights or bootstrap sampling.
+
+</p>
+
+</div>
+
+```{r eval=FALSE}
+#smote
+Train_Smote <- SMOTE(STATUS ~ ., data= Train, perc.over = 2100, perc.under = 100)
+y_Train_Smote <- Train_Smote$STATUS
+table(Train_Smote$STATUS)
+```
+
+
+### 6.Classification Models
+
+
+
+<p style="font-family: times, serif; font-size:10pt">
+Different model were trained on the dataset. ....
+</p>
+
+##### 6.1 Logistic Regression
+<p style="font-family: times, serif; font-size:10pt">
+Logistic Regression is a special case of one of the generalized linear models (GLM). Logistic Regression is parametric and it predicts the probability of an outcome variable being 0 or 1. The probability (p) is linked to a linear function of the predictors using the Log of the odds (Log(p/1-p)) or the logit function. The logit function maps the output from [-inf, inf] to [0,1] which is then transformed to class 1 if p > 0.5 and 0 otherwise. Parameters (theta) for the predictors are estimated using maximum likelihood (MLE), with the p= 1/1+exp(-thetaTx).
+The values are assumed linear in the logit space, and nonlinear (sigmoid) on the natural scale. Logistic regression does not make any assumptions over the distribution of the classes. However, when classes are well separated, the parameter estimates can be unstable.
+Further adding regularization to the optimization can shrink parameters (in Ridge/Lasso) and zero some (in Lasso) to avoid overfitting to the training data and manage the variance. This shrinkage (controlled by alpha and lambda) is optimized using CV to tradeoff bias-variance.
+For Logistic Regression, we have used the Smote upsampled data, with a Log function applied to the continuous variables to manage skewness. Also scaling and centering is done as part of the modeling. We have implemented Bagging to glmnet function, with the possibility of setting the sample fraction, replacement strategy for the bootstrap. The prediction is made via majority voting.
+</p>
+
+
+```{r eval=FALSE,warning=FALSE,message=FALSE}
+#Model.Matrix
+X_Train_Smote <- model.matrix(STATUS ~ ., data= Train_Smote)
+X_Test <- model.matrix(STATUS ~ ., data= Test)
+
+#logistic REg
+Train_Smote_Log <- Train_Smote
+
+#skewness control, log transformation
+Train_Smote_Log$INCOME_TO_FAM_RATIO <- log(Train_Smote$INCOME_TO_FAM_RATIO)
+Train_Smote_Log$AMT_INCOME_TOTAL <- log(Train_Smote$AMT_INCOME_TOTAL) 
+Train_Smote_Log$AGE <- log(Train_Smote$AGE)
+Train_Smote_Log$YEARS_EMPLOYED <- log(Train_Smote$YEARS_EMPLOYED)
+
+Test_Log <- Test
+
+Test_Log$INCOME_TO_FAM_RATIO <- log(Test$INCOME_TO_FAM_RATIO)
+Test_Log$AMT_INCOME_TOTAL <- log(Test$AMT_INCOME_TOTAL) 
+Test_Log$AGE <- log(Test$AGE)
+Test_Log$YEARS_EMPLOYED <- log(Test$YEARS_EMPLOYED)
+
+#Model Matrix conversion
+X_Train_Smote_Log <- model.matrix(STATUS ~ ., data= Train_Smote_Log)
+X_Test_Log <- model.matrix(STATUS ~ ., data= Test_Log)
+```
+
+
+
+```{r eval=FALSE}
+set.seed(7)
+#Native GLM function
+logistic.model <- glm(STATUS ~., data = Train_Smote_Log, family = "binomial")
+saveRDS(logistic.model, "lg.glm.rds")
+```
+
+
+```{r eval=FALSE,warning=FALSE,message=FALSE,fig.height= 7}
+#Subset Selection using AIC, BIC,..
+#doesn't work on Caret, only glm
+set.seed(7)
+
+step.model <- logistic.model %>% stepAIC(direction= "both", trace = FALSE) #"forward"
+
+df <- data.frame(Name= factor(names(coef(step.model))), Coefficient= coef(step.model))
+df <- df[df$Name != "(Intercept)",]
+df <- df[order(abs(df$Coefficient), decreasing = F), ]
+df$Name <- factor(df$Name, levels= df$Name)
+ggplot(data= df, aes(x= Name, y= Coefficient, fill= Coefficient)) + geom_bar(stat='identity') + coord_flip()
+
+saveRDS(step.model, "lg.AIC.rds")
+
+```
+
+```{r eval=FALSE,warning=FALSE,message=FALSE}
+#BAGGING Functions
+myBagging <- function(Train, alpha, lambda, nbags= 11, sample.fraction= 0.5, replace= FALSE, resampling = "boot"){
+  
+  bagmodel <- list()
+  attr(bagmodel, "model") <- list()
+  attr(bagmodel, "paras") <- c(alpha= alpha, lambda= lambda)
+  attr(bagmodel, "F1.oob") <- c()
+  n <- nrow(Train)
+  oob_f1 <- c()
+  if (nbags <= 1) {
+    print("nbags set to 11")
+    nbags = 11}
+
+  for (i in 1:nbags) {
+      if (resampling == "boot"){
+      indices <- sample(1:n, size = n*sample.fraction, replace = replace)
+      train <- Train[indices,]
+      oob <- Train[-indices,]
+      y_train <- train$STATUS
+      y_test <- oob$STATUS
+      
+    } else if (resampling == "downsample"){
+      indices <- sample(1:n, size = n*sample.fraction, replace = replace)
+      train <- Train[indices,]
+      oob <- Train[-indices,]
+      y_test <- oob$STATUS
+      
+      indices_0 <- which(train$STATUS == 0)
+      indices_1 <- which(train$STATUS == 1)
+      if (length(indices_0) > length(indices_1)){
+        indices_remove <- indices_0[1:(length(indices_0)- length(indices_1))]
+        
+      } else if (length(indices_1) > length(indices_0)){
+        indices_remove <- indices_1[1:(length(indices_1)- length(indices_0))]
+      }
+      train <- train[-indices_remove, ]
+      y_train <- train$STATUS
+
+      
+    } else if (resampling == "downsample.complete.1") { #where no smote preprocessing, retains full records of rare class 1 
+      indices_0 <- which(Train$STATUS == 0) 
+      indices_1 <- which(Train$STATUS == 1)
+      indices_0 <- sample(indices_0, replace = replace, size= length(indices_1))
+      train <- Train[c(indices_0, indices_1), ]
+      oob <- Train[-c(indices_0, indices_1), ]
+      y_train <- train$STATUS
+      y_test <- oob$STATUS
+      
+      
+    } else if (resampling == "smote.upsample"){ #advised where no smote preprocessing
+      indices <- sample(1:n, size = n*sample.fraction, replace = replace)
+      train <- Train[indices,]
+      oob <- Train[-indices,]
+      train <- SMOTE(STATUS ~ ., data= train, perc.over = 100)
+      y_train <- train$STATUS
+      y_test <- oob$STATUS
+    }
+    
+    train= model.matrix(STATUS ~ ., data= train)
+    oob= model.matrix(STATUS ~ ., data= oob)
+    
+    newbag <- glmnet:: glmnet(x= train, y= y_train, alpha= alpha, lambda = lambda, family = "binomial")
+    #add the new model to the bag
+    bagmodel$model[[i]] <- newbag
+     
+    #prediction
+    preds <- predict(newbag, newx= oob, type= "class") 
+    oob_f1 <- c(oob_f1, F1_Score(preds, y_test))
+  }
+  
+  #mean oob_ef1
+  bagmodel$F1.oob <- mean(oob_f1, na.rm= T)
+
+  return(bagmodel)
+}
+
+#prediction for the bagging model
+myBaggingPredict <- function(bagmodel, newdata, type= "response"){
+  
+  newdata <- model.matrix(STATUS ~ ., data= newdata)
+  preds <- lapply(bagmodel$model, function(m) { predict(m, newx= newdata, type= type) })
+  preds <- as.data.frame(preds)
+
+  #return preds
+  if (type == "response"){
+    preds <- rowMeans(preds) #return probs from parallel bags probs
+  } else { #type == "class"
+    preds <- sapply(preds, as.numeric) #from factor
+    preds <- ifelse(rowMeans(preds - 1) < 0.5, 0, 1)#return classes from parallel bags classes 
+  }
+
+  return(preds)
+}
+```
+
+
+```{r eval=FALSE,warning=F}
+#BAGGING LOGISTIC REGRESSION
+set.seed(7)
+#no alpha or lambda for logistic with no regularization
+
+my.log.bag <- myBagging(Train= Train_Smote_Log, alpha=0, lambda= 0, nbags= 5, sample.fraction = 0.8, replace= F, resampling = "downsample")
+
+saveRDS(my.log.bag, "my.log.bag.rds") 
+```
+
+```{r eval=FALSE,}
+#Lasso Regression
+set.seed(7)
+
+cv.lasso <- cv.glmnet(X_Train_Smote_Log, y_Train_Smote, alpha = 1, family="binomial")#default range
+plot(cv.lasso)
+
+bestlam <- cv.lasso$lambda.min 
+
+lasso.model <- glmnet(X_Train_Smote_Log, y_Train_Smote, alpha = 1, family = "binomial",
+                lambda = bestlam, standardize = T)
+
+saveRDS(lasso.model, "lasso.rg.rds") 
+```
+
+
+
+```{r eval=FALSE,warning=F}
+set.seed(7)
+#BAgging lasso regression
+
+my.lasso.bag <- myBagging(Train= Train_Smote_Log, alpha=1, lambda= bestlam, nbags= 51, sample.fraction = 0.8, replace= F, resampling = "downsample")
+
+saveRDS(my.lasso.bag, "lasso.bagging.rds") 
+```
+
+
+```{r eval=FALSE,warning=FALSE }
+#ELASTIC NET
+
+set.seed(7)
+cluster <- makeCluster(detectCores()-1)
+registerDoParallel(cluster)
+
+
+
+trnCtrl <- trainControl(method = "cv", number = 10, allowParallel = TRUE, preProcOptions = list(thresh = 0.9))#, method= "boot", sampling = "smote")
+
+tuneGrid <- expand.grid(alpha = seq(0, 1, length= 10), lambda =  10^seq(6, -4, length = 10))
+
+# Fit a model
+elastic.caret <- train(STATUS ~ ., Train_Smote_Log, method = "glmnet", standarize= T, tuneGrid= tuneGrid, preProcess= c("center", "scale", "pca"), trControl = trnCtrl, family= "binomial")
+stopCluster(cluster)
+
+#plot(elastic.caret)
+
+saveRDS(elastic.caret, "elastic.caret.rds") 
+
+```
+
+```{r eval=FALSE,warning=F}
+set.seed(7)
+#Bagging Elastic Net
+
+my.elastic.bag <- myBagging(Train= Train_Smote_Log, alpha= elastic.caret$bestTune$alpha, lambda= elastic.caret$bestTune$lambda, nbags= 51, sample.fraction = 0.8, replace= F, resampling = "boot")
+
+
+saveRDS(my.elastic.bag, "bagging.elastic_caret.rds") 
+```
+
+
+
+##### 6.2 K-Nearest Neighbour
+
+<p style="font-family: times, serif; font-size:10pt">
+K-nearest neighbours computes the distance of a new unlabelled data point from all other labeled data points in the training data. Based on the class labels of the K nearest neighbors, where K is a hyperparameter, the new data point is assigned the majority class label. K is preferably an odd number so there are no ties in the case of a binary classification. This is a lazy learning algorithm as all the computation is done at the time of testing. No weights and or parameters are learnt in the training stage as the distance will vary and therefore have to be calculated for each new test data point.
+</p>
+
+```{r KNN,eval=FALSE, warning = FALSE}
+#BASELINE MODEL
+set.seed(7) #Set Seed for reproducibility
+cluster <- makeCluster(detectCores()-1) #Use all CPU Cores available except 1, leave that for OS
+registerDoParallel(cluster) #Tell R that the cluster of Cores can be used
+
+#Write the code required 
+knn <- train(STATUS ~ ., data= Train, method = "knn", preProcess = c("center","scale"), trControl = trainControl(method = "repeatedcv", repeats = 10, allowParallel = TRUE))
+
+saveRDS(knn, "knn.baseline.rds") 
+
+#Unlink the Cluster of CPU Cores
+stopCluster(cluster)
+```
+
+```{r SMOTEKNN,eval=FALSE, warning = FALSE}
+#SMOTED KNN
+set.seed(7) #Set Seed for reproducibility
+cluster <- makeCluster(detectCores()-1) #Use all CPU Cores available except 1, leave that for OS
+registerDoParallel(cluster) #Tell R that the cluster of Cores can be used
+
+#Write the code required 
+knn_smoted <- train(STATUS ~ ., data= Train_Smote_Log, method = "knn", preProcess = c("center","scale"), trControl = trainControl(method = "repeatedcv", repeats =5, allowParallel = TRUE))
+
+saveRDS(knn_smoted, "knn.smote.rds") 
+#Unlink the Cluster of CPU Cores
+stopCluster(cluster)
+```
+
+##### 6.3 Linear Discriminant Analysis
+<p style="font-family: times, serif; font-size:10pt">
+Linear Discriminant Analysis estimates the probability that a new set of inputs belongs to every class. The output class is the one that has the highest probability. LDA makes its prediction by using Bayes' Theorem to estimate the probabilities.We used two sampling methods, cv and bootstrapping with 10 folds
+Model was optimised by performing over sampling and feature selection on training data
+</p>
+
+```{r eval=FALSE,warning=FALSE,message=FALSE}
+## Training on model without SMOTE
+#set levels for metric= "ROC" to work
+#levels(Train_Smote$STATUS) <- c("Low.Risk", "High.Risk")
+#levels(Test$STATUS) <- c("Low.Risk", "High.Risk")
+
+
+ctrl <- trainControl(method = "cv",number=10)
+lda.model <- train(STATUS ~ . , data = Train, method = "lda",  
+                   trControl = ctrl)
+
+saveRDS(lda.model,"LDA.NOSMOTE.rds")
+
+## LDA Model with SMOTE
+ctrl1 <- trainControl(method = "cv",number=10)
+lda.model2 <- train(STATUS ~ . , data = Train_Smote, method = "lda",  
+                   trControl = ctrl1)
+saveRDS(lda.model2,"LDA.SMOTE.rds")
+
+## LDA with Feature Selection
+lda.model3 <- train(STATUS ~ NAME_HOUSING_TYPE + FLAG_OWN_REALTY + NAME_FAMILY_STATUS + CODE_GENDER + NAME_EDUCATION_TYPE , data = Train_Smote, method = "lda",  
+                   trControl = ctrl1)
+
+saveRDS(lda.model3,"LDA.Feature.Sel")
+
+## LDA with SMOTE and bootstrapping with feature selection
+ctrl2 <- trainControl(method = "boot")
+lda.model4 <- train(STATUS ~ NAME_HOUSING_TYPE + FLAG_OWN_REALTY + NAME_FAMILY_STATUS + CODE_GENDER + NAME_EDUCATION_TYPE , data = Train_Smote, method = "lda",  
+                   trControl = ctrl2)
+
+saveRDS(lda.model4,"LDA.SMOTE.BTSTRP")
+
+#set levels for roc_curve to work
+#levels(Train_Smote$STATUS) <- c(0,1)
+#levels(Test$STATUS) <- c(0, 1)
+```
+
+
+
+##### 6.4 Descision Tree
+
+```{r eval=FALSE}
+set.seed(7)
+
+rpartdt = rpart(STATUS~., data = Train, method = 'class' , 
+                parms = list(prior = c(0.5, 0.5), split = "gini"))
+saveRDS(rpartdt,"dt.base.rds")
+```
+
+```{r eval=FALSE}
+set.seed(7)
+
+rpartdt.smoted = rpart(STATUS~., data = Train_Smote, method = 'class',
+                parms = list(prior = c(0.4, 0.6), split = "gini") )
+saveRDS(rpartdt.smoted,"dt.smoted.rds")
+```
+
+##### 6.5 Random Forest
+
+<p style="font-family: times, serif; font-size:10pt">
+Random Forest (RF) is an ensemble method used for classification, in which we can grow multiple trees as opposed to a single tree in a decision tree. Random Forest is a non parametric model (i.e., the complexity grows as the number of training samples increases). The final prediction for classification is determined through majority vote, this helps limit the variance, but ideally optimized through cross-validation (CV) to avoid bias. Random forests can be used to rank the importance of variables in a classification problem based on how common they are used for splits and on their score improvement contribution. Training a non parametric model can be more expensive computationally, compared to parametric ones like GLM.
+For Random Forest, we have used the imputed data, Smote upsampled data and down sampled data for training models. We have implemented repeated crossfold validations to optimize RF number of bootstrap features used, number of grown trees and resampling.
+</p>
+```{r eval=FALSE,warning=FALSE}
+#upsampling
+cluster <- makeCluster(detectCores()-1)
+registerDoParallel(cluster)
+set.seed(7)
+
+model_rf<-randomForest(STATUS ~ ., data = Train_Smote,ntree=50,importance = TRUE)
+saveRDS(model_rf, "model_rf_smote.rds")
+
+#DownSampling Random Forest
+ctrl <- trainControl(method = "boot",
+                     sampling = "down")
+
+
+down_rf <- train(STATUS~., data = Train_Smote,
+                     method = "ranger",
+                     num.trees = 50,
+                     trControl = ctrl)
+
+
+
+saveRDS(down_rf, "rf_smote_down.rds")
+stopCluster(cluster)
+```
+
+
+```{r eval=FALSE,warning=FALSE,eval=FALSE}
+# Random Forest using class weights and F1 as tunning measure 
+#Baseline  Model
+set.seed(7)
+cluster <- makeCluster(detectCores()-1)
+registerDoParallel(cluster)
+
+# the sum of weight is 1
+model_weights <- ifelse(Train$STATUS == "0",
+                        (1/table(Train$STATUS)[1]) * 0.30,
+                         (1/table(Train$STATUS)[2]) * 0.70)
+
+#rfgrid <- expand.grid(mtry=seq(from=2,to=46,by=1),min.node.size=c(2,3,5),splitrule=c("gini","extratrees"))
+
+ctrl <- trainControl(method="repeatedcv",number=10,
+                     allowParallel=TRUE,
+                     summaryFunction = prSummary, 
+                     returnResamp = "all",
+                     savePredictions = "all")
+
+rf.model.weighted <- train(STATUS~.,Train,
+                           method="ranger",
+                           weights=model_weights,
+                           trControl=ctrl,
+                           metric=c("F"),
+                           importance="impurity",
+                           )
+stopCluster(cluster)
+saveRDS(rf.model.weighted, "baseline.rf.rds")
+```
+
+```{r eval=FALSE,rfplot,eval=FALSE}
+plot(rf.model.weighted,xlab="mtry values",ylab="F1 Score",main="Random Forest Tunning for mtry and split rule")
+v <- varImp(rf.model.weighted)
+plot(v,top=10,xlab='Variable',main="Feature Importance Plot")
+```
+
+```{r eval=FALSE,warning=FALSE}
+#SMOTED Random Forest
+set.seed(7)
+cluster <- makeCluster(detectCores()-1)
+registerDoParallel(cluster)
+
+ctrl <- trainControl(method="repeatedcv",number=10,allowParallel=TRUE,summaryFunction = prSummary, returnResamp = "all",
+                       savePredictions = "all")
+
+rf.smoted<- train(STATUS~.,Train_Smote,method="ranger",trControl=ctrl,metric=c("F"),importance="impurity")
+stopCluster(cluster)
+saveRDS(rf.smoted, "smoted.rf.rds")
+```
+
+
+
+
+```{r, eval=FALSE }
+# looking at number of trees
+wts <- table(Train_Smote$STATUS)/length(Train_Smote$STATUS)
+num.trees <- c(100, 200, 500, 1000)
+OOB <- sapply(num.trees, function(n) {
+  set.seed(7)
+
+  rf.ranger <- ranger(STATUS ~ ., data = Train_Smote, class.weights= c(wts[[1]], wts[[2]] ), replace = FALSE, sample.fraction = 0.8, min.node.size = 5, num.trees = n, importance= "impurity", probability = TRUE, oob.error= TRUE)
+  
+  rf.ranger$prediction.error
+})
+
+OOB= data.frame(OOB= OOB, num.trees= num.trees)
+ggplot(data= OOB, aes(x= num.trees, y= OOB)) + geom_line(color="blue") + geom_vline(aes(xintercept= 500)) + ggtitle("Num of Trees vs Out-of-Bag Error")
+
+```
+
+
+```{r eval=FALSE}
+#train model
+set.seed(7)
+wts <- table(Train_Smote$STATUS)/length(Train_Smote$STATUS)
+
+rf.ranger <- ranger(STATUS ~ ., data = Train_Smote, class.weights= c(wts[[1]], wts[[2]] ), replace = F, sample.fraction = 0.8, min.node.size = 5, mtry= 5, importance= "impurity", probability = TRUE, oob.error= TRUE)
+
+saveRDS(rf.ranger, "rf.ranger.rds")
+#rf.ranger <- readRDS("rf.ranger.rds")
+```
+
+
+```{r,eval=FALSE }
+rf.ranger <- readRDS("rf.ranger.rds")
+
+imp <- data.frame(Feature = names(rf.ranger$variable.importance), Importance= unname(rf.ranger$variable.importance))
+imp <- imp[order(imp$Importance, decreasing = F), ]
+imp$Feature <- factor(imp$Feature, levels= imp$Feature)
+
+ggplot(data= imp, aes(x= Importance, y= Feature,fill= Importance)) + geom_bar(stat="identity", position="dodge")
+
+
+```
+##### 6.6 Suport Vector Machine 
+<p style="font-family: times, serif; font-size:10pt">
+Support Vector Machine is a supervised learning model used for classification tasks. The SVM objective is to find a distinct hyperplane in an N-dimensional that can distinctly classify the data. Because of that, SVM doesn’t support un-supervised training. As shown in figure below.
+</p>
+
+```{r SVM Image}
+knitr::include_graphics("svm.png")
+```
+<p style="font-family: times, serif; font-size:10pt">
+There are some hyperparameters that can be tuned to get better performance. For example, there are many kernel types that can be used for SVM and C is a cost of constraint violation. SVM provides an access to adjust the weight of each label class so we can handle the imbalance data by adjusting class-weight parameters. We tried SVM with both Smote training sets, without Smote, apply class weights and apply both to compare the performance. After we find the best dataset, we try different kernel types and compare its performance. We also try different C to tune the hyperparameter.
+</p>
+
+
+```{r  warning = FALSE, eval = FALSE}
+#baseline SVM
+set.seed(7) #Set Seed for reproducibility
+cluster <- makeCluster(detectCores()-1) #Use all CPU Cores available except 1, leave that for OS
+registerDoParallel(cluster) #Tell R that the cluster of Cores can be used
+
+#Write the code required
+set.seed(7)
+svm <- ksvm(STATUS ~ ., data = Train, kernel = "vanilladot")
+
+saveRDS(svm, "svm.vanilladot.baseline.rds") 
+
+#Unlink the Cluster of CPU Cores
+stopCluster(cluster)
+```
+```{r eval = FALSE}
+#Baseline RFDOT 
+set.seed(7) #Set Seed for reproducibility
+cluster <- makeCluster(detectCores()-1) #Use all CPU Cores available except 1, leave that for OS
+registerDoParallel(cluster) #Tell R that the cluster of Cores can be used
+
+svmfit.baseline <- ksvm(STATUS ~ ., data = Train, kernel = "rbfdot", C = 10)
+
+saveRDS(svmfit.baseline, "svmfit_rfdot.noSmote.rds")
+
+#Unlink the Cluster of CPU Cores
+stopCluster(cluster)
+```
+
+```{r eval = FALSE}
+# SVM RBFDOT WITH SMOTE
+set.seed(7) #Set Seed for reproducibility
+cluster <- makeCluster(detectCores()-1) #Use all CPU Cores available except 1, leave that for OS
+registerDoParallel(cluster) #Tell R that the cluster of Cores can be used
+
+svmfit <- ksvm(STATUS ~ ., data = Train_Smote, kernel = "rbfdot", C = 10)
+##  Setting default kernel parameters
+
+saveRDS(svmfit, "svmfit.rfdot.smote.rds")
+
+#Unlink the Cluster of CPU Cores
+stopCluster(cluster)
+```
+
+
+```{r warning = FALSE, eval = FALSE}
+#SVM with weights
+set.seed(7) #Set Seed for reproducibility
+cluster <- makeCluster(detectCores()-1) #Use all CPU Cores available except 1, leave that for OS
+registerDoParallel(cluster) #Tell R that the cluster of Cores can be used
+
+#SVM With Cost
+set.seed(7)
+svm <- ksvm(STATUS ~ ., data = Train, kernel = "rbfdot", C = 10, class.weights= c("0" = 15, "1" = 25))
+
+saveRDS(svmfit, "svmfit.rbfdot.cost.rds")
+
+#Unlink the Cluster of CPU Cores
+stopCluster(cluster)
+```
+
+
+```{r warning = FALSE, eval = FALSE}
+#SMOTED SVM with weights
+set.seed(7) #Set Seed for reproducibility
+cluster <- makeCluster(detectCores()-1) #Use all CPU Cores available except 1, leave that for OS
+registerDoParallel(cluster) #Tell R that the cluster of Cores can be used
+
+#SVM with Smote with COST
+
+set.seed(7)
+svmfit <- ksvm(STATUS ~ ., data = Train_Smote, kernel = "rbfdot", C = 10, class.weights= c("0" = 15, "1" = 25))
+
+saveRDS(svmfit, "svmfit_smoted.rbfdot.cost.rds")
+```
+
+```{r warning = FALSE, eval = FALSE}
+set.seed(7) #Set Seed for reproducibility
+cluster <- makeCluster(detectCores()-1) #Use all CPU Cores available except 1, leave that for OS
+registerDoParallel(cluster) #Tell R that the cluster of Cores can be used
+
+# SVM Vanilladot
+set.seed(7)
+
+svmfit <- ksvm(STATUS ~ ., data = Train_Smote, kernel = "vanilladot", C = 10)
+##  Setting default kernel parameters
+prediction_result <- predict(svmfit, newdata = Test)
+
+saveRDS(svmfit, "svmfit.smoted.vanilla.rds")
+
+
+#Unlink the Cluster of CPU Cores
+stopCluster(cluster)
+```
+
+
+```{r warning = FALSE, eval = FALSE}
+set.seed(7) #Set Seed for reproducibility
+cluster <- makeCluster(detectCores()-1) #Use all CPU Cores available except 1, leave that for OS
+registerDoParallel(cluster) #Tell R that the cluster of Cores can be used
+
+# SVM polydot
+set.seed(7)
+
+svmfit <- ksvm(STATUS ~ ., data = Train_Smote, kernel = "polydot", C = 10)
+##  Setting default kernel parameters
+prediction_result <- predict(svmfit, newdata = Test)
+
+saveRDS(svmfit, "svmfit.smoted.polydot.rds")
+
+
+#Unlink the Cluster of CPU Cores
+stopCluster(cluster)
+```
+
+```{r warning = FALSE, eval = FALSE}
+set.seed(7) #Set Seed for reproducibility
+cluster <- makeCluster(detectCores()-1) #Use all CPU Cores available except 1, leave that for OS
+registerDoParallel(cluster) #Tell R that the cluster of Cores can be used
+
+# SVM Tanhdot
+set.seed(7)
+
+svmfit <- ksvm(STATUS ~ ., data = Train_Smote, kernel = "tanhdot", C = 10)
+##  Setting default kernel parameters
+prediction_result <- predict(svmfit, newdata = Test)
+
+saveRDS(svmfit, "svmfit.smoted.tanh.rds")
+
+
+#Unlink the Cluster of CPU Cores
+stopCluster(cluster)
+```
+
+```{r warning = FALSE, eval = FALSE}
+set.seed(7) #Set Seed for reproducibility
+cluster <- makeCluster(detectCores()-1) #Use all CPU Cores available except 1, leave that for OS
+registerDoParallel(cluster) #Tell R that the cluster of Cores can be used
+
+# SVM laplacedot
+set.seed(7)
+
+svmfit <- ksvm(STATUS ~ ., data = Train_Smote, kernel = "laplacedot", C = 10)
+##  Setting default kernel parameters
+prediction_result <- predict(svmfit, newdata = Test)
+
+saveRDS(svmfit, "svmfit.smoted.laplace.rds")
+
+
+#Unlink the Cluster of CPU Cores
+stopCluster(cluster)
+```
+
+```{r warning = FALSE, eval = FALSE}
+set.seed(7) #Set Seed for reproducibility
+cluster <- makeCluster(detectCores()-1) #Use all CPU Cores available except 1, leave that for OS
+registerDoParallel(cluster) #Tell R that the cluster of Cores can be used
+
+# SVM besseldot
+set.seed(7)
+
+svmfit <- ksvm(STATUS ~ ., data = Train_Smote, kernel = "besseldot", C = 10)
+##  Setting default kernel parameters
+prediction_result <- predict(svmfit, newdata = Test)
+
+saveRDS(svmfit, "svmfit.smoted.besseldot.rds")
+
+
+
+#Unlink the Cluster of CPU Cores
+stopCluster(cluster)
+```
+
+
+##### 6.7 XGBOOST (eXtreme Garident Boosting Algorithm)
+<p style="font-family: times, serif; font-size:10pt">
+XGBOOST uses gradient boosting decision tree algorithm.In boosting models are added subsequently until no further improvements can be made. Errors made by previous model are corrected by new model. Gradient boosting uses gradient descent algorithm to minimize the loss when adding new models and new models are build to fit the pseudo residuals of previous model. 
+
+XGBOOST model was trained on both SMOTED data and original data.Scale_POS_WEIGHT was used to handle the imbalance class which is the ratio of negative class to positive class.
+</p>
+```{r warning=FALSE,message=FALSE,eval=FALSE}
+set.seed(7)
+#Baseline XGBOOST
+#Preprocesing for XGBOOST
+#Seprate target from data
+data.labels <-as.data.frame(data$STATUS)
+colnames(data.labels) <- "STATUS"
+
+
+#subset of all numeric colmn
+data.numeric <- data[,sapply(data,is.numeric)]
+
+data.categorical <- data[,sapply(data,is.factor)]
+data.categorical <- data.categorical[,-12] #removing target variable
+
+#one hot matrix for factorial
+categorical <- model.matrix(~.-1,data.categorical)
+data.cmb <- cbind(data.numeric,categorical,data.labels)
+data_matrix <- data.matrix(data.cmb)
+
+#training and test set
+
+inTrain <- createDataPartition(data.cmb$STATUS,p=0.8)[[1]]
+Train.XGB <- data.cmb[inTrain,]
+Test.XGB <- data.cmb[-inTrain,]
+dim(Train.XGB)
+dim(Test.XGB)
+table(Train.XGB$STATUS)
+
+X_train.XGB <- Train.XGB[,-48]
+y_train.XGB <- as.data.frame(Train.XGB$STATUS)
+colnames(y_train.XGB) <- "STATUS"
+
+#testing data
+X_test.XGB <- Test.XGB[,-48]
+y_test.XGB <- as.data.frame(Test.XGB$STATUS)
+colnames(y_test.XGB) <- "STATUS"
+
+#test & train data to two separate Dmatrix objects
+dtrain <- xgb.DMatrix(data=as.matrix(X_train.XGB),label=as.matrix(y_train.XGB))
+dtest <- xgb.DMatrix(data=as.matrix(X_test.XGB),label=as.matrix(y_test.XGB))
+
+negative_cases <- sum(y_train.XGB$STATUS=="0")
+positive_Cases <- sum(y_train.XGB$STATUS=="1")
+cluster <- makeCluster(detectCores()-1)
+
+registerDoParallel(cluster)
+xg.weights <- xgboost::xgboost(data=dtrain,
+                 max_depth=3,nround=40,
+                 early_stopping_rounds = 3,
+                 objective="binary:logistic",scale_pos_weight=negative_cases/positive_Cases,
+                 gamma = 1)
+stopCluster(cluster)
+saveRDS(xg.weights, "xgb.base.rds")
+```
+
+
+```{r eval=FALSE,warning=FALSE,message=FALSE}
+# SMOTED XGBOOST
+data.smoted <- SMOTE(STATUS~.,Train.XGB,perc.over=2100,perc.under =100)
+table(data.smoted$STATUS)
+set.seed(7)
+X_train.XGB <- data.smoted[,-48]
+y_train.XGB <- as.data.frame(data.smoted$STATUS)
+colnames(y_train.XGB) <- "STATUS"
+
+#testing data
+X_test.XGB <- Test.XGB[,-48]
+y_test.XGB <- as.data.frame(Test.XGB$STATUS)
+colnames(y_test.XGB) <- "STATUS"
+
+dtrain.smoted <- xgb.DMatrix(data=as.matrix(X_train.XGB),label=as.matrix(y_train.XGB))
+dtest.smoted <- xgb.DMatrix(data=as.matrix(X_test.XGB),label=as.matrix(y_test.XGB))
+
+
+# XGBOOST (eXtreme Garident Boosting Algorithm)
+
+cluster <- makeCluster(detectCores()-1)
+registerDoParallel(cluster)
+xgb.smoted <- xgboost::xgboost(data=dtrain.smoted,
+                 max_depth=3,nround=40,
+                 early_stopping_rounds = 3,
+                 objective="binary:logistic",scale_pos_weight=negative_cases/positive_Cases,
+                 gamma = 1)
+stopCluster(cluster)
+saveRDS(xgb.smoted, "xgb.smoted.rds")
+```
+
+
+### 7.Classification Performance Evaluation
+
+
+```{r eval=FALSE}
+#Logistic Regression
+#Evaluation table
+lg.model <- readRDS("lg.glm.rds")
+lg.mode2 <- readRDS("lg.AIC.rds")
+lg.mode3 <- readRDS("my.log.bag.rds")
+lg.mode4 <- readRDS("lasso.rg.rds")
+lg.mode5 <- readRDS("lasso.bagging.rds")
+lg.mode6 <- readRDS("elastic.caret.rds")
+lg.mode7 <- readRDS("bagging.elastic_caret.rds")
+
+pred1 <- predict(lg.model, newdata = Test_Log,type='response')
+pred1 <- as.factor(ifelse(pred1 < 0.5,0,1))
+pred2 <- predict(lg.mode2, newdata = Test_Log,type='response')
+pred2 <- as.factor(ifelse(pred2 < 0.5,0,1))
+pred3 <- myBaggingPredict(bagmodel = lg.mode3, newdata = Test_Log,type="response")
+pred3 <- as.factor(ifelse(pred3 < 0.5,0,1))
+pred4 <- predict(lg.mode4, s = bestlam, newx = X_Test_Log, type="class")
+pred5 <-  myBaggingPredict(bagmodel = lg.mode5, newdata = Test_Log, type= "response")
+pred5 <- as.factor(ifelse(pred5 < 0.5,0,1))
+pred6 <- predict(lg.mode6, newdata = Test_Log) 
+pred7 <- myBaggingPredict(bagmodel = lg.mode7, newdata = Test_Log, type= "response")
+pred7 <- ifelse(pred7 < 0.5, 0, 1)
+
+results(pred1,pred2,pred3,pred4,pred5,pred6,pred7,truth = Test$STATUS,model.names = c('Logistic Regression GLM','Logistic AIC Step','Bagged Logistic','Lasso Regression','Baggging Lasso Regression','Elastic NET','Bagging Elastic Net'))
+
+#K Nearest Neighbour
+knn.model1 <- readRDS("knn.baseline.rds")
+knn.model2 <- readRDS("knn.smote.rds") 
+
+knn.pred1 <- predict(knn.model1, newdata = Test,type="prob")
+knn.pred1 <- apply(knn.pred1,1,which.max)-1
+knn.pred2 <- predict(knn.model2, newdata = Test_Log,type="prob")  
+knn.pred2 <- apply(knn.pred2,1,which.max)-1
+
+results(knn.pred1,knn.pred2 ,truth = Test$STATUS,model.names = c("KNN Baseline","KNN SMOTED" ))
+
+#Linear Discriminant Analysis
+lda.model <- readRDS("LDA.NOSMOTE.rds")
+lda.model1 <- readRDS("LDA.SMOTE.rds")
+lda.model2 <- readRDS("LDA.Feature.Sel")
+lda.model3 <- readRDS("LDA.SMOTE.BTSTRP")
+
+pred.lda <- predict(lda.model, newdata = Test)
+pred.lda1 <- predict(lda.model1, newdata = Test)
+pred.lda2 <- predict(lda.model2, newdata = Test)
+pred.lda3 <- predict(lda.model3, newdata = Test)
+
+results(pred.lda,pred.lda1,pred.lda2,pred.lda3,truth = Test$STATUS,model.names = c('LDA','LDA with SMOTE','SMOTED LDA with Feature Selction','SMOTED LDA with Feature Selection & BootStrapping'))
+
+#Decision Tree
+dt.model1 <- readRDS("dt.base.rds")
+dt.model2 <- readRDS("dt.smoted.rds") 
+
+dt.pred1 <- predict(dt.model1, newdata = Test , type="class") 
+dt.pred2 <- predict(dt.model2, newdata = Test , type="class")  
+
+results(dt.pred1,dt.pred2 ,truth = Test$STATUS,model.names = c("DT Baseline","DT SMOTED" ))
+
+#Random Forest
+rf.model1 <- readRDS("baseline.rf.rds")
+rf.model2 <- readRDS("smoted.rf.rds")
+rf.model3 <- readRDS("rf_smote_down.rds")
+rf.model4 <- readRDS("model_rf_smote.rds")
+rf.model5 <- readRDS("rf.ranger.rds")
+
+
+
+
+
+pred.rf1 <- predict(rf.model1, newdata = Test)
+pred.rf2 <- predict(rf.model2, newdata = Test)
+pred.rf3 <- predict(rf.model3, newdata = Test)
+pred.rf4 <- predict(rf.model4, newdata = Test)
+
+
+rf.pred.prob <- predict(rf.model5, data = Test)$predictions #2d
+rf.pred5 <- apply(rf.pred.prob, 1, which.max) - 1 #assigned class
+rf.pred.prob <- apply(rf.pred.prob, 1, max) #max prob
+
+results(pred.rf1,pred.rf2,pred.rf3,pred.rf4,rf.pred5,truth = Test$STATUS,model.names = c('Baseline Random Forest using Class Weights','SMOTED Random Forest','Upsampled SMOTED Random Forest','Downsampled SMOTED Random Forest','SMOTED Random Forest using wieghts'))
+
+#Support Vector Machine
+svm.model1 <- readRDS("svm.vanilladot.baseline.rds")
+svm.model2 <- readRDS("svmfit_rfdot.noSmote.rds")
+svm.model3 <- readRDS("svmfit.rfdot.smote.rds")
+svm.model4 <- readRDS("svmfit.rbfdot.cost.rds")
+svm.model5 <- readRDS("svmfit_smoted.rbfdot.cost.rds")
+svm.model6 <- readRDS("svmfit.smoted.vanilla.rds")
+svm.model7 <- readRDS("svmfit.smoted.polydot.rds")
+svm.model8 <- readRDS("svmfit.smoted.tanh.rds")
+svm.model9 <- readRDS("svmfit.smoted.laplace.rds")
+svm.model10 <- readRDS("svmfit.smoted.besseldot.rds")
+
+
+svm.pred1 <- predict(svm.model1,newdata=Test)
+svm.pred2 <- predict(svm.model2,newdata=Test)
+svm.pred3 <- predict(svm.model3,newdata=Test)
+svm.pred4 <- predict(svm.model4,newdata=Test)
+svm.pred5 <- predict(svm.model5,newdata=Test)
+svm.pred6 <- predict(svm.model6,newdata=Test)
+svm.pred7 <- predict(svm.model7,newdata=Test)
+svm.pred8 <- predict(svm.model8,newdata=Test)
+svm.pred9 <- predict(svm.model9,newdata=Test)
+svm.pred10 <- predict(svm.model10,newdata=Test)
+
+
+model_names= c("Baseline SVM (Vanilladot)","Baseline SVM (rbfdot)","SMOTE SVM (rbfdot)","Baseline SVM using Cost(rbfdot)","SMOTE SVM using Cost(rbfdot)","SMOTE SVM (Vanilladot)","SMOTE SVM (polydot)","SMOTE SVM (tanhdot)","SMOTE SVM (laplace)","SMOTE SVM (besseledot)")
+
+results(svm.pred1,svm.pred2,svm.pred3,svm.pred4,svm.pred5,svm.pred6,svm.pred7,svm.pred8,svm.pred9,
+        svm.pred10,truth = Test$STATUS,model.names =model_names)
+
+# XGBoost
+xgb.model1 <- readRDS("xgb.base.rds")
+xgb.model2 <- readRDS("xgb.smoted.rds")
+
+pred.xgb1 <- predict(xgb.model1, newdata = dtest)
+pred.xgb1.decision <- ifelse(as.numeric(pred.xgb1 > 0.5),"1","0")
+
+pred.xgb2 <- predict(xgb.model2, newdata = dtest.smoted)
+pred.xgb2.decision <- ifelse(as.numeric(pred.xgb2 > 0.5),"1","0")
+
+results(pred.xgb1.decision,pred.xgb2.decision,truth = y_test.XGB$STATUS,model.names = c('Baseline XGBOOST using weights','SMOTED XGBOOST'))
+
+```
+
+<p style="font-family: times, serif; font-size:10pt">
+Given the significant class imbalance and the needed to identify high risk customers successfully, hence accuracy was not a suitable evaluation metric. Instead, we looked towards the F1-Score which was the harmonic mean between Recall and Precision. While the Recall evaluates what proportion of true positive classes were identified correctly, the Precision checks what proportion of predicted positive identifications were actually correct. We also used the Area under ROC curve that plots the Sensitivity vs Specificity as an evaluation metric to better present the ratio of True Positives to True Negatives.
+
+</p>
+
+```{r echo=FALSE,fig.cap="Performance of all models trained"}
+knitr::include_graphics("Evaluation_Results.PNG")
+```
+
+```{r echo=FALSE, fig.cap="Model comparison"}
+knitr::include_graphics("Result_Visualisation.PNG")
+```
+
+
+<p style="font-family: times, serif; font-size:10pt">
+There is little variation that can be observed in F1 Scores once we plot the results for different models except for decision tree which seems to have a slightly lower score than the other classifiers. Decision Tree's poor performance can also be verified by looking at the AUC Score where Decision tree has a significantly lesser score compared to the rest of the models.
+
+Overall, it can be said that the best performing classifier is LDA followed by Logistic Regression and XGBoost.
+
+
+</p>
+
+
+### 8.Conclusion
+<p style="font-family: times, serif; font-size:10pt">
+After working through the dataset we found several problems with it:
+Most features are simplistic and therefore they might not be good predictors for the target.
+The features predictability is questionable (ex. we see many records having very little work experience as compared to their age). Age vs income total relation is not significant enough, not essentially reflecting a larger population trend.
+68% of the dataset is duplicated which casts doubt over the genuity of the dataset.
+
+For the last reason, we looked at a similar dataset, which very similarly aims to predict customers eligible for a bank loan. The Bank Loan data includes similar features as our current Credit Card Prediction dataset such as: education, default, balance, housing, and loan. The Bank Loan data is highly imbalanced and larger in size. This is how our models tuned to it, achieving considerably higher F1 scores:
+</p>
+```{r echo=FALSE, fig.cap="ROC Curve showing True positives and False positives on comparison dataset"}
+knitr::include_graphics("Conclusion_fig.PNG")
+```
+
+<p style="font-family: times, serif; font-size:10pt">
+This, from our perspective, shows that our models are able to train well and our initial attempts to address the imbalance in the data are vindicated. However our chosen dataset is the major cause behind the low F1 scores.
+
+Despite the challenges, we were able to come up with the following conclusions about the dataset:
+Many of the risky customers happen to have cars and real estates.
+The data does not provide a bank balance, only income amount. Risky customers seem to come from most professions, across all income ranges.
+
+</p>
